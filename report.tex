@@ -1,0 +1,374 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{parskip}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true,
+    columns=flexible
+}
+
+\title{
+    \textbf{Conversational AI for E-Commerce} \\
+    \large A Vision-Based Approach via CLIP, FAISS, and Claude Sonnet\\[0.5em]
+    \normalsize Generative AI: Principles and Applications Final
+}
+\author{Ethan Chen, Gavin Kunish}
+\date{May 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+The report outlines the design and implementation of a multimodal conversational chatbot
+for e-commerce product support. It combines CLIP embeddings, a FAISS vector index, and Claude claude-sonnet-4-6 to answer product related questions using both text and image inputs.Built on the Kaggle Amazon Product Dataset 2020 of 10,002 products. The full system is deployed
+as a Streamlit application that supports natural language queries, product image uploads, and
+three prompting modes (zero-shot, few-shot, and multi-shot).
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% -----------------------------------------------------------------------
+\section{Introduction}
+% -----------------------------------------------------------------------
+
+Customer support in e-commerce is expensive and often bottlenecked by the sheer variety of
+product-related questions. A customer might ask about specifications, usage instructions,
+compatibility, or simply want to know what a product in an image is. Traditional text-only
+chatbots cannot handle the image input case, and retrieval-only systems cannot generate
+coherent, context-aware answers.
+
+A multimodal Retrieval-Augmented Generation (RAG) system addresses both of these gaps.
+By using a vision-language model for retrieval and a large language model (LLM) for generation,
+the system can match a query whether it comes in as text or an image to relevant products in
+a catalog and then synthesize a helpful, grounded response.
+
+The project builds such a system end-to-end:
+\begin{itemize}
+    \item \textbf{Data:} Amazon Product Dataset 2020, 10,002 products
+    \item \textbf{Encoder:} CLIP ViT-B/32 for shared text-image embeddings
+    \item \textbf{Index:} FAISS \texttt{IndexFlatIP} for exact cosine-similarity search
+    \item \textbf{LLM:} claude-sonnet-4-6 via the Anthropic API
+    \item \textbf{Interface:} Streamlit web application
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Related Work}
+% -----------------------------------------------------------------------
+
+\subsection{CLIP}
+CLIP (Contrastive Language-Image Pre-training)~\cite{radford2021clip} trains a text encoder
+and an image encoder jointly on 400 million image-text pairs from the web. The training
+objective pulls matching text-image pairs together in a shared embedding space while pushing
+non-matching pairs apart. The result is an encoder that can produce semantically comparable
+vectors for text and images---which is exactly what is needed for cross-modal retrieval.
+
+\subsection{Retrieval-Augmented Generation}
+RAG~\cite{lewis2020rag} combines a retrieval step with a generative model. At inference time,
+relevant documents are fetched from an external knowledge base and passed as context to the LLM.
+This keeps the LLM from hallucinating product facts it was never trained on, and makes the
+knowledge base easy to update without retraining.
+
+\subsection{Large Language Models}
+Modern LLMs like Claude can follow complex instructions, maintain multi-turn conversation history,
+and process image inputs natively. This makes them well-suited as the generation component in a
+multimodal RAG pipeline.
+
+% -----------------------------------------------------------------------
+\section{Data}
+% -----------------------------------------------------------------------
+
+\subsection{Dataset}
+The Amazon Product Dataset 2020 is available on Kaggle. The version used here contains
+10,002 products across several categories, with Toys \& Games (66.6\%) being the largest,
+followed by Home \& Kitchen (7.1\%) and Clothing, Shoes \& Jewelry (6.3\%).
+
+\subsection{Fields and Preprocessing}
+The dataset contains 28 columns. After reviewing them, the following five were chosen for
+building product descriptions:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Field} & \textbf{Usage} \\
+\midrule
+Product Name     & Primary identifier; placed first in the description \\
+Brand Name       & Appended as ``Brand: X'' \\
+Category         & Top-level only (text before first pipe character) \\
+Selling Price    & Appended as ``Price: X'' \\
+About Product    & First 300 characters; pipe delimiters replaced with periods \\
+\bottomrule
+\end{tabular}
+\caption{Product fields used for CLIP text descriptions}
+\end{table}
+
+Fields like \texttt{Product Specification} and \texttt{Technical Details} were excluded
+because they contain heavy HTML-like markup that degrades CLIP text quality. The five
+selected fields cover the information customers most commonly ask about.
+
+The combined description is passed through the CLIP processor with
+\texttt{truncation=True, max\_length=77} to respect the model's token limit.
+Image URLs are preserved in metadata but are not embedded at index time.
+
+% -----------------------------------------------------------------------
+\section{System Architecture}
+% -----------------------------------------------------------------------
+
+The pipeline has three stages: encoding, retrieval, and generation.
+
+\begin{enumerate}
+    \item \textbf{Encoding.} At index build time, each product description is embedded with
+    CLIP's text encoder into a 512-dimensional L2-normalized vector. At query time, the user's
+    text or uploaded image is embedded with the corresponding CLIP encoder.
+    \item \textbf{Retrieval.} The query vector is compared against all 10,002 stored vectors
+    using FAISS inner product search. The top-k most similar products are returned.
+    \item \textbf{Generation.} The retrieved product metadata (name, brand, price, description)
+    is formatted into a context block and passed to Claude along with the user's question.
+    Claude generates a natural language response grounded in that context.
+\end{enumerate}
+
+\subsection{CLIP Model}
+\texttt{openai/clip-vit-base-patch32} was used. The ViT-B/32 variant processes images as
+$14 \times 14$ patches of $32 \times 32$ pixels and produces 512-dimensional embeddings for
+both modalities. Text and image embeddings are projected into the same space via
+\texttt{text\_projection} and \texttt{visual\_projection} layers respectively.
+
+One implementation challenge was that transformers version 5.5.0 changed the return type of
+\texttt{get\_text\_features()} and \texttt{get\_image\_features()}. These methods returned a
+\texttt{BaseModelOutputWithPooling} object instead of a tensor. The fix was to call the
+sub-models directly:
+
+\begin{lstlisting}[language=Python]
+# Text embedding
+out   = model.text_model(input_ids=..., attention_mask=...)
+feats = model.text_projection(out.pooler_output)
+feats = feats / feats.norm(dim=-1, keepdim=True)
+
+# Image embedding
+out   = model.vision_model(pixel_values=...)
+feats = model.visual_projection(out.pooler_output)
+feats = feats / feats.norm(dim=-1, keepdim=True)
+\end{lstlisting}
+
+\subsection{FAISS Index}
+\texttt{faiss.IndexFlatIP} performs exact inner product search. Since all vectors are
+L2-normalized, inner product equals cosine similarity. The exact index is appropriate at
+10k scale; for millions of products an approximate index (\texttt{IndexIVFFlat} or HNSW)
+would be needed.
+
+\subsection{LLM and Prompting}
+Claude claude-sonnet-4-6 was chosen because it supports both text and image in the same API
+request, handles multi-turn conversation history natively, and follows system prompts reliably.
+
+Three prompting modes are implemented:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Mode} & \textbf{Description} \\
+\midrule
+Zero-shot & System prompt defines the role and task only. No examples. \\
+Few-shot  & System prompt includes 3 worked Q\&A examples covering features,
+            comparisons, and image identification. \\
+Multi-shot & System prompt includes 5 examples covering price, age suitability,
+             product comparison, usage, and color/variant queries. \\
+\bottomrule
+\end{tabular}
+\caption{Prompt modes and their descriptions}
+\end{table}
+
+The user question is always framed as: ``Product context from our database: [context]
+Customer question: [question].'' Conversation history is passed on every turn so follow-up
+questions work correctly.
+
+% -----------------------------------------------------------------------
+\section{Implementation}
+% -----------------------------------------------------------------------
+
+\subsection{Index Building (\texttt{build\_index.py})}
+This one-time script loads the CSV, constructs product descriptions, encodes them in batches
+of 128, and saves the FAISS index and JSON metadata to disk. Total time on CPU is roughly
+4--5 minutes for 10,002 products.
+
+\subsection{Retrieval Module (\texttt{rag.py})}
+Module-level singletons hold the FAISS index, product metadata, CLIP model, and processor.
+They are loaded once on first call to \texttt{retrieve()} and reused for all subsequent calls.
+The \texttt{retrieve()} function accepts either a text query or a PIL image.
+
+\subsection{Streamlit Application (\texttt{app.py})}
+The app has three tabs:
+\begin{itemize}
+    \item \textbf{Chat:} Main chatbot interface. Users type questions or upload a product
+    image. Retrieved products and their images are displayed below each assistant response.
+    \item \textbf{Evaluation:} Shows the pre-computed Recall@1/5/10 metrics and a bar chart.
+    A ``Run Evaluation Now'' button re-runs the evaluation live.
+    \item \textbf{Documentation:} Architecture overview, data preprocessing details, model
+    descriptions, and file structure.
+\end{itemize}
+
+\texttt{@st.cache\_resource} is used for the RAG resources (loaded once per Streamlit server
+process). \texttt{@st.cache\_data} is used for product image downloads.
+
+% -----------------------------------------------------------------------
+\section{Evaluation}
+% -----------------------------------------------------------------------
+
+\subsection{Test Set Construction}
+200 products are sampled uniformly at random (seed=42) from the index. Each product's
+exact name is used as the query. The ground truth is that the queried product should appear
+in the top-k retrieved results among the 10,001 competing distractors.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Score} \\
+\midrule
+Accuracy@1  & 0.940 \\
+Recall@1    & 0.940 \\
+Recall@5    & 0.985 \\
+Recall@10   & 0.990 \\
+\bottomrule
+\end{tabular}
+\caption{Retrieval evaluation results (n=200 test queries)}
+\end{table}
+
+A Recall@1 of 0.94 means that 94\% of queries have the correct product as the single
+top result. Recall@10 of 0.99 means that 99\% of queries have the correct product
+somewhere in the first 10 results. These are strong results for exact-name queries on
+a 10k-product index.
+
+\subsection{Discussion}
+The high recall is expected when the query is the product's exact name, since CLIP encodes
+names consistently. The 6\% miss rate at Recall@1 comes from a few failure modes: products
+with very generic names (e.g., ``Blue T-Shirt'') that match multiple similar items, and
+products with names containing special characters or model numbers that CLIP tokenizes
+differently than expected.
+
+\subsection{Limitations of the Evaluation}
+This evaluation only covers text-to-text retrieval. Cross-modal retrieval (image query
+against text index) is harder to measure without a manually annotated image test set, which
+the Amazon Product Dataset does not include. Response quality (whether the LLM's answer is
+accurate and helpful) is also not formally measured here and would require human evaluation
+or a dedicated benchmark.
+
+% -----------------------------------------------------------------------
+\section{Challenges and Solutions}
+% -----------------------------------------------------------------------
+
+\textbf{Transformers API change.}
+Transformers v5.5.0 changed the return signature of \texttt{get\_text\_features()} and
+\texttt{get\_image\_features()}, returning a dataclass instead of a tensor. The fix was to
+call \texttt{text\_model} and \texttt{vision\_model} directly and apply the projection layers
+manually. This is more explicit and version-stable.
+
+\textbf{Image URL availability.}
+Amazon CDN image URLs from 2020 are frequently unavailable or return 403 errors. Rather than
+embedding images at index time (which would have failed for most products), image URLs are
+stored in metadata and fetched on-demand in the Streamlit app with error handling. This keeps
+the index fast to build while still displaying images when they are available.
+
+\textbf{CLIP token limit.}
+CLIP's text encoder has a hard limit of 77 tokens. Long product descriptions were silently
+truncated by the processor, sometimes cutting off key features. The fix was to pre-truncate
+the ``About Product'' field to 300 characters before concatenating, so the most important
+parts (name, brand, category, price) always fit within the token budget.
+
+\textbf{Streamlit session state with image uploads.}
+Streamlit re-runs the entire script on each interaction. Without care, the uploaded file
+reference would reset between the upload and the chat submission. The fix was to read the
+file bytes immediately and store them in a local variable, and to call \texttt{seek(0)} after
+reading so the file object is still valid for display.
+
+% -----------------------------------------------------------------------
+\section{Future Improvements}
+% -----------------------------------------------------------------------
+
+\textbf{Fine-tuned CLIP.}
+The off-the-shelf CLIP model was not trained on e-commerce data. Fine-tuning on Amazon
+product image-description pairs (using the dataset's image URLs) would improve cross-modal
+alignment for product-specific visual features like color, material, and form factor.
+
+\textbf{Image embedding at index time.}
+Currently, only text embeddings are stored. Downloading and embedding product images would
+enable true image-to-image similarity search and improve image-query results.
+
+\textbf{Hybrid retrieval.}
+Combining CLIP's semantic search with keyword-based BM25 retrieval would handle queries
+like exact model numbers (``B07KMVJJK7'') that CLIP handles poorly because they are
+out-of-vocabulary.
+
+\textbf{Approximate indexing.}
+At 10k products, brute-force \texttt{IndexFlatIP} is fast enough. For a production catalog
+with millions of products, an HNSW or IVF index would reduce query latency significantly.
+
+\textbf{Response evaluation.}
+Adding an automated evaluation of LLM response quality using a judge model or RAGAS
+framework would give a more complete picture of end-to-end system performance beyond
+retrieval recall.
+
+% -----------------------------------------------------------------------
+\section{Conclusion}
+% -----------------------------------------------------------------------
+
+This project demonstrates that a relatively simple RAG pipeline CLIP embeddings, FAISS
+retrieval, and a capable LLM can power a practical multimodal e-commerce chatbot. The
+retrieval stage is highly accurate (Recall@10 = 0.99) and the system handles both text and
+image queries cleanly. The main limitations are around image URL reliability and the lack
+of cross-modal evaluation data, both of which are dataset constraints rather than
+architectural ones.
+
+The full source code, FAISS index, and metadata are included in the project submission.
+The Streamlit app can be run locally with \texttt{streamlit run app.py} after providing
+an Anthropic API key.
+
+% -----------------------------------------------------------------------
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{radford2021clip}
+Radford, A., Kim, J. W., Hallacy, C., Ramesh, A., Goh, G., Agarwal, S., \ldots \& Sutskever, I. (2021).
+\textit{Learning transferable visual models from natural language supervision.}
+Proceedings of the 38th International Conference on Machine Learning (ICML).
+
+\bibitem{lewis2020rag}
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., \ldots \& Kiela, D. (2020).
+\textit{Retrieval-augmented generation for knowledge-intensive NLP tasks.}
+Advances in Neural Information Processing Systems (NeurIPS).
+
+\bibitem{johnson2019faiss}
+Johnson, J., Douze, M., \& Jegou, H. (2019).
+\textit{Billion-scale similarity search with GPUs.}
+IEEE Transactions on Big Data.
+
+\bibitem{anthropic2024claude}
+Anthropic. (2024).
+\textit{The Claude 3 Model Family: Opus, Sonnet, Haiku.}
+Technical Report.
+
+\end{thebibliography}
+
+\end{document}
