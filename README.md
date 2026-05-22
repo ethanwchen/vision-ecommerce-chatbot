@@ -1,4 +1,4 @@
-# vision-ecommerce-chatbot
+# Vision E-Commerce Chatbot
 
 Multimodal e-commerce chatbot that answers product questions from text or image inputs. Uses CLIP for retrieval, FAISS for vector search, and Claude as the LLM. Built on the Amazon Product Dataset 2020 (10,002 products).
 
